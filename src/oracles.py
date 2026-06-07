@@ -4,47 +4,59 @@ from scipy.special import expit
 
 
 class BaseSmoothOracle(object):
-    """
-    Base class for implementation of oracles.
-    """
-
+    """Base class for smooth function."""
     def func(self, x):
-        """
-        Computes the value of function at point x.
-        """
-        raise NotImplementedError('Func oracle is not implemented.')
+        raise NotImplementedError('Func is not implemented.')
 
     def grad(self, x):
-        """
-        Computes the gradient at point x.
-        """
-        raise NotImplementedError('Grad oracle is not implemented.')
+        raise NotImplementedError('Grad is not implemented.')
 
     def hess(self, x):
-        """
-        Computes the Hessian matrix at point x.
-        """
-        raise NotImplementedError('Hessian oracle is not implemented.')
+        raise NotImplementedError('Hess is not implemented.')
 
     def func_directional(self, x, d, alpha):
-        """
-        Computes phi(alpha) = f(x + alpha*d).
-        """
         return np.squeeze(self.func(x + alpha * d))
 
     def grad_directional(self, x, d, alpha):
-        """
-        Computes phi'(alpha) = (f(x + alpha*d))'_{alpha}
-        """
         return np.squeeze(self.grad(x + alpha * d).dot(d))
 
 
-class QuadraticOracle(BaseSmoothOracle):
-    """
-    Oracle for quadratic function:
-       func(x) = 1/2 x^TAx - b^Tx.
-    """
+class BaseProxOracle(object):
+    """Base class for proximal h(x)-part in a composite function f(x) + h(x)."""
+    def func(self, x):
+        raise NotImplementedError('Func is not implemented.')
 
+    def prox(self, x, alpha):
+        raise NotImplementedError('Prox is not implemented.')
+
+
+class BaseCompositeOracle(object):
+    """phi(x) := f(x) + h(x), where f is a smooth part, h is a simple part."""
+    def __init__(self, f, h):
+        self._f = f
+        self._h = h
+
+    def func(self, x):
+        return self._f.func(x) + self._h.func(x)
+
+    def grad(self, x):
+        return self._f.grad(x)
+
+    def prox(self, x, alpha):
+        return self._h.prox(x, alpha)
+
+
+class BaseNonsmoothConvexOracle(object):
+    """Base class for implementation of oracle for nonsmooth convex function."""
+    def func(self, x):
+        raise NotImplementedError('Func is not implemented.')
+
+    def subgrad(self, x):
+        raise NotImplementedError('Subgrad is not implemented.')
+
+
+class QuadraticOracle(BaseSmoothOracle):
+    """Oracle for quadratic function: func(x) = 1/2 x^TAx - b^Tx."""
     def __init__(self, A, b):
         if scipy.sparse.issparse(A):
             if (A != A.T).nnz != 0:
@@ -52,7 +64,6 @@ class QuadraticOracle(BaseSmoothOracle):
         else:
             if not np.allclose(A, A.T):
                 raise ValueError('A should be a symmetric matrix.')
-
         self.A = A
         self.b = b
 
@@ -67,10 +78,7 @@ class QuadraticOracle(BaseSmoothOracle):
 
 
 class NonConvexOracle(BaseSmoothOracle):
-    """
-    Oracle for test function from your assignment.
-    """
-
+    """Oracle for Himmelblau test function."""
     def __init__(self):
         pass
 
@@ -91,24 +99,93 @@ class NonConvexOracle(BaseSmoothOracle):
         ], dtype='d')
 
 
-class PoissonL2Oracle(BaseSmoothOracle):
+class L1RegOracle(BaseProxOracle):
     """
-    Oracle for regression loss  function with l2 regularization:
-         check your individual assignment
-
-    Let A and b be parameters of the model (feature matrix
-    and labels vector respectively).
-
-    Parameters
-    ----------
-        matvec_Ax : function
-            Computes matrix-vector product Ax, where x is a vector of size n.
-        matvec_ATx : function of x
-            Computes matrix-vector product A^Tx, where x is a vector of size m.
-        matmat_ATsA : function
-            Computes matrix-matrix-matrix product A^T * Diag(s) * A,
+    Oracle for L1-regularizer: h(x) = regcoef * ||x||_1.
     """
+    def __init__(self, regcoef):
+        self.regcoef = regcoef
 
+    def func(self, x):
+        return self.regcoef * np.linalg.norm(x, 1)
+
+    def prox(self, x, alpha):
+        """Soft-thresholding operator."""
+        threshold = alpha * self.regcoef
+        return np.sign(x) * np.maximum(np.abs(x) - threshold, 0.0)
+
+    def lmo(self, grad, radius):
+        """
+        Linear Minimization Oracle for L1-ball.
+        Returns y_k = argmin_{||y||_1 <= R} <grad, y>
+        """
+        i = np.argmax(np.abs(grad))
+        y = np.zeros_like(grad)
+        y[i] = -radius * np.sign(grad[i])
+        return y
+
+
+class BarrierL1Oracle(object):
+    """
+    Oracle for the barrier function in the barrier method:
+    F_t(x, u) = t*(f(x) + lambda*sum(u)) - sum(ln(u_i - x_i)) - sum(ln(u_i + x_i))
+
+    State vector z = [x, u] (concatenation).
+    """
+    def __init__(self, smooth_oracle, lambda_reg, t):
+        self.smooth_oracle = smooth_oracle
+        self.lambda_reg = lambda_reg
+        self.t = t
+
+    def _split(self, z):
+        n = len(z) // 2
+        return z[:n], z[n:]
+
+    def func(self, z):
+        x, u = self._split(z)
+        d = u - x  # must be > 0
+        s = u + x  # must be > 0
+        return (self.t * (self.smooth_oracle.func(x) + self.lambda_reg * np.sum(u))
+                - np.sum(np.log(d)) - np.sum(np.log(s)))
+
+    def grad(self, z):
+        x, u = self._split(z)
+        d = u - x
+        s = u + x
+        gx = self.t * self.smooth_oracle.grad(x) + 1.0 / d - 1.0 / s
+        gu = self.t * self.lambda_reg * np.ones_like(u) - 1.0 / d - 1.0 / s
+        return np.concatenate([gx, gu])
+
+    def hess(self, z):
+        x, u = self._split(z)
+        n = len(x)
+        d = u - x
+        s = u + x
+        d2 = 1.0 / d ** 2
+        s2 = 1.0 / s ** 2
+
+        # Smooth part Hessian (n x n)
+        Hf = np.asarray(self.smooth_oracle.hess(x))
+
+        # Build 2n x 2n Hessian
+        H = np.zeros((2 * n, 2 * n))
+
+        # x-x block: t*Hf + diag(1/d^2 + 1/s^2)
+        H[:n, :n] = self.t * Hf + np.diag(d2 + s2)
+
+        # u-u block: diag(1/d^2 + 1/s^2)
+        H[n:, n:] = np.diag(d2 + s2)
+
+        # x-u block (and u-x): diag(-1/d^2 + 1/s^2)
+        xu_diag = np.diag(-d2 + s2)
+        H[:n, n:] = xu_diag
+        H[n:, :n] = xu_diag
+
+        return H
+
+
+class RegressionSmoothOracle(BaseSmoothOracle):
+    """Smooth oracle for Poisson regression loss with L2 regularization."""
     def __init__(self, matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef):
         self.matvec_Ax = matvec_Ax
         self.matvec_ATx = matvec_ATx
@@ -133,24 +210,8 @@ class PoissonL2Oracle(BaseSmoothOracle):
         return np.asarray(self.matmat_ATsA(np.exp(z))) / self.m + self.regcoef * np.eye(x.size)
 
 
-class LogisticL2Oracle(BaseSmoothOracle):
-    """
-    Oracle for classification loss  function with l2 regularization:
-         check your individual assignment
-
-    Let A and b be parameters of the model (feature matrix
-    and labels vector respectively).
-
-    Parameters
-    ----------
-        matvec_Ax : function
-            Computes matrix-vector product Ax, where x is a vector of size n.
-        matvec_ATx : function of x
-            Computes matrix-vector product A^Tx, where x is a vector of size m.
-        matmat_ATsA : function
-            Computes matrix-matrix-matrix product A^T * Diag(s) * A,
-    """
-
+class ClassificationSmoothOracle(BaseSmoothOracle):
+    """Smooth oracle for logistic regression loss with L2 regularization."""
     def __init__(self, matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef):
         self.matvec_Ax = matvec_Ax
         self.matvec_ATx = matvec_ATx
@@ -175,55 +236,86 @@ class LogisticL2Oracle(BaseSmoothOracle):
         return np.asarray(self.matmat_ATsA(s)) / self.m + self.regcoef * np.eye(x.size)
 
 
+# Keep old names as aliases for backward compatibility
+PoissonL2Oracle = RegressionSmoothOracle
+LogisticL2Oracle = ClassificationSmoothOracle
+
+
+class RegressionNonsmoothOracle(BaseNonsmoothConvexOracle):
+    """regression_loss + regcoef * ||x||_1."""
+    def __init__(self, matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef):
+        self._smooth = RegressionSmoothOracle(matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef=0.0)
+        self.regcoef = regcoef
+
+    def func(self, x):
+        return self._smooth.func(x) + self.regcoef * np.linalg.norm(x, 1)
+
+    def subgrad(self, x):
+        return self._smooth.grad(x) + self.regcoef * np.sign(x)
+
+
+class ClassificationNonsmoothOracle(BaseNonsmoothConvexOracle):
+    """classification_loss + regcoef * ||x||_1."""
+    def __init__(self, matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef):
+        self._smooth = ClassificationSmoothOracle(matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef=0.0)
+        self.regcoef = regcoef
+
+    def func(self, x):
+        return self._smooth.func(x) + self.regcoef * np.linalg.norm(x, 1)
+
+    def subgrad(self, x):
+        return self._smooth.grad(x) + self.regcoef * np.sign(x)
+
+
+class RegressionProxOracle(BaseCompositeOracle):
+    """
+    Oracle for regression_loss + regcoef * ||x||_1.
+    f(x) = regression_loss (smooth, no L2), h(x) = regcoef * ||x||_1 (simple).
+    """
+    def __init__(self, matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef=1.0):
+        f = RegressionSmoothOracle(matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef=0.0)
+        h = L1RegOracle(regcoef)
+        super().__init__(f, h)
+
+
+class ClassificationProxOracle(BaseCompositeOracle):
+    """
+    Oracle for classification_loss + regcoef * ||x||_1.
+    f(x) = classification_loss (smooth, no L2), h(x) = regcoef * ||x||_1 (simple).
+    """
+    def __init__(self, matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef=1.0):
+        f = ClassificationSmoothOracle(matvec_Ax, matvec_ATx, matmat_ATsA, b, regcoef=0.0)
+        h = L1RegOracle(regcoef)
+        super().__init__(f, h)
+
+
 def grad_finite_diff(func, x, eps=1e-8):
-    """
-    Returns approximation of the gradient using finite differences:
-        result_i := (f(x + eps * e_i) - f(x)) / eps,
-        where e_i are coordinate vectors:
-        e_i = (0, 0, ..., 0, 1, 0, ..., 0)
-                          >> i <<
-    """
     x = np.asarray(x, dtype='d')
     n = x.size
     result = np.zeros(n)
     fx = func(x)
-
     for i in range(n):
         x_eps = x.copy()
         x_eps[i] += eps
         result[i] = (func(x_eps) - fx) / eps
-
     return result
 
 
 def hess_finite_diff(func, x, eps=1e-5):
-    """
-    Returns approximation of the Hessian using finite differences:
-        result_{ij} := (f(x + eps * e_i + eps * e_j)
-                               - f(x + eps * e_i) 
-                               - f(x + eps * e_j)
-                               + f(x)) / eps^2,
-        where e_i are coordinate vectors:
-        e_i = (0, 0, ..., 0, 1, 0, ..., 0)
-                          >> i <<
-    """
     x = np.asarray(x, dtype='d')
     n = x.size
     result = np.zeros((n, n))
     fx = func(x)
     eps2 = eps ** 2
-
     f_i = np.zeros(n)
     for i in range(n):
         x_eps = x.copy()
         x_eps[i] += eps
         f_i[i] = func(x_eps)
-
     for i in range(n):
         for j in range(n):
             x_eps_ij = x.copy()
             x_eps_ij[i] += eps
             x_eps_ij[j] += eps
             result[i][j] = (func(x_eps_ij) - f_i[i] - f_i[j] + fx) / eps2
-
     return result
